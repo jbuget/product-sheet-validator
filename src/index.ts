@@ -8,6 +8,7 @@ import { Agent, setGlobalDispatcher } from 'undici';
 interface CliOptions {
   inputPath: string;
   outputPath: string;
+  validatePdfLinks: boolean;
 }
 
 interface ValidationOutcome {
@@ -18,6 +19,7 @@ interface ValidationOutcome {
 
 const DEFAULT_INPUT = 'input/products.csv';
 const DEFAULT_OUTPUT = 'output/results.csv';
+const DEFAULT_VALIDATE_PDF_LINKS = true;
 const MAX_CONCURRENT_REQUESTS = 16;
 const ANSI_GREEN = '\x1b[32m';
 const ANSI_RED = '\x1b[31m';
@@ -34,6 +36,7 @@ function parseCliArgs(argv: string[]): CliOptions {
   const args = [...argv.slice(2)];
   let inputPath = DEFAULT_INPUT;
   let outputPath = DEFAULT_OUTPUT;
+  let validatePdfLinks = DEFAULT_VALIDATE_PDF_LINKS;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -51,6 +54,10 @@ function parseCliArgs(argv: string[]): CliOptions {
       }
       outputPath = value;
       i += 1;
+    } else if (arg === '--skip-pdf-validation') {
+      validatePdfLinks = false;
+    } else if (arg === '--pdf-validation') {
+      validatePdfLinks = true;
     } else if (arg === '--help' || arg === '-h') {
       printUsage();
       process.exit(0);
@@ -62,6 +69,7 @@ function parseCliArgs(argv: string[]): CliOptions {
   return {
     inputPath: resolve(process.cwd(), inputPath),
     outputPath: resolve(process.cwd(), outputPath),
+    validatePdfLinks,
   };
 }
 
@@ -71,6 +79,8 @@ function printUsage(): void {
     'Options:\n' +
     '  -i, --input <path>    Fichier CSV d\'entrée (défaut: input/products.csv)\n' +
     '  -o, --output <path>   Fichier CSV de sortie (défaut: output/results.csv)\n' +
+    '  --skip-pdf-validation  Désactive la vérification des liens PDF\n' +
+    '  --pdf-validation       Force la vérification des liens PDF (valeur par défaut)\n' +
     '  -h, --help            Affiche cette aide\n';
   console.log(message);
 }
@@ -91,7 +101,6 @@ async function run(): Promise<void> {
       throw new Error('Impossible de trouver une colonne "URL" dans le CSV');
     }
 
-    const orderedUrls: string[] = [];
     const seenUrls = new Set<string>();
     const uniqueUrls: string[] = [];
 
@@ -100,34 +109,33 @@ async function run(): Promise<void> {
       if (!url) {
         continue;
       }
-      orderedUrls.push(url);
       if (!seenUrls.has(url)) {
         seenUrls.add(url);
         uniqueUrls.push(url);
       }
     }
 
+    if (uniqueUrls.length === 0) {
+      console.warn('Aucune URL valide trouvée dans le fichier d\'entrée.');
+    }
+
     const outcomes: ValidationOutcome[] = [];
 
-    if (orderedUrls.length === 0) {
-      console.warn('Aucune URL valide trouvée dans le fichier d\'entrée.');
-    } else {
+    if (uniqueUrls.length > 0) {
       const totalUnique = uniqueUrls.length;
-      const progress = totalUnique > 0 ? createProgressReporter(totalUnique, 10_000) : null;
-      const loggedUniqueUrls = new Set<string>();
+      const progress = createProgressReporter(totalUnique, 10_000);
       let uniqueOutcomes: Map<string, ValidationOutcome> = new Map();
 
       try {
-        uniqueOutcomes = await validateUrls(uniqueUrls, (outcome) => {
-          progress?.onProcessed();
-          loggedUniqueUrls.add(outcome.url);
+        uniqueOutcomes = await validateUrls(uniqueUrls, options.validatePdfLinks, (outcome) => {
+          progress.onProcessed();
           logOutcome(outcome);
         });
       } finally {
-        progress?.finish();
+        progress.finish();
       }
 
-      for (const url of orderedUrls) {
+      for (const url of uniqueUrls) {
         const outcome = uniqueOutcomes.get(url);
         if (!outcome) {
           const fallback: ValidationOutcome = {
@@ -140,9 +148,6 @@ async function run(): Promise<void> {
           continue;
         }
         outcomes.push(outcome);
-        if (!loggedUniqueUrls.has(url)) {
-          logOutcome(outcome);
-        }
       }
     }
 
@@ -152,15 +157,6 @@ async function run(): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`Erreur: ${message}`);
     process.exitCode = 1;
-  }
-}
-
-function isHttpUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-  } catch (error) {
-    return false;
   }
 }
 
@@ -232,8 +228,18 @@ function findUrlColumnIndex(header: string[]): number {
   return header.findIndex((column) => column.trim().toLowerCase() === 'url');
 }
 
+function isHttpUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch (error) {
+    return false;
+  }
+}
+
 async function validateUrls(
   urls: string[],
+  validatePdfLinks: boolean,
   onOutcome?: (outcome: ValidationOutcome) => void,
 ): Promise<Map<string, ValidationOutcome>> {
   const results = new Map<string, ValidationOutcome>();
@@ -251,7 +257,7 @@ async function validateUrls(
       const index = currentIndex;
       currentIndex += 1;
       const url = urls[index];
-      const outcome = await validateProductPage(url);
+      const outcome = await validateProductPage(url, validatePdfLinks);
       results.set(url, outcome);
       if (onOutcome) {
         onOutcome(outcome);
@@ -263,7 +269,8 @@ async function validateUrls(
   return results;
 }
 
-async function validateProductPage(url: string): Promise<ValidationOutcome> {
+async function validateProductPage(url: string, validatePdfLinks: boolean): Promise<ValidationOutcome> {
+  // Vérifier que l'URL est valide et utilise HTTP ou HTTPS
   if (!isHttpUrl(url)) {
     return {
       url,
@@ -273,50 +280,82 @@ async function validateProductPage(url: string): Promise<ValidationOutcome> {
   }
 
   try {
+    // Récupérer la page HTML
     const page = await fetchPage(url);
+
+    // Vérifier qu'il n'y a pas eu de redirection vers un autre produit ou la page d'accueil
     if (!isSameProductUrl(url, page.finalUrl) || page.redirected) {
       const target = page.finalUrl;
-      const comments = `Redirection vers ${target}`;
-      return buildOutcome(url, false, false, false, [comments]);
+      return {
+        url,
+        result: 'KO',
+        comments: `Redirection vers ${target}`
+      };
     }
 
+    // Charger le code HTML
     const $ = load(page.html);
 
+    const extraComments: string[] = [];
+
+    // Vérifier la présence de la section de documentation qui contient les liens PDF
     const documentationSection = findDocumentationSection($);
     if (!documentationSection) {
-      return buildOutcome(url, false, false, true, []);
+      return {
+        url,
+        result: 'KO',
+        comments: `Section product-documentation absente (fiche de sécurité et technique manquantes)`,
+      };
     }
 
+    // Vérifier la présence du lien vers la fiche de données de sécurité
     const safetyHref = findDocumentationLink(documentationSection, [
       'product-documentation__link',
       'product-documentation__link--safety-data-sheet',
     ]);
+    const hasSafetySheet = Boolean(safetyHref);
+    if (hasSafetySheet) {
+      if (safetyHref &&  validatePdfLinks) {
+        const safetyValid = await isValidPdfLink(page.finalUrl, safetyHref);
+        if (!safetyValid) {
+          extraComments.push('Lien vers la fiche de sécurité invalide');
+        }
+      }
+    } else {
+      extraComments.push('Fiche de sécurité manquante');
+    }
+
+    // Vérifier la présence du lien vers la fiche technique
     const technicalHref = findDocumentationLink(documentationSection, [
       'product-documentation__link',
       'product-documentation__link--technical-data-sheet',
     ]);
-
-    const extraComments: string[] = [];
-    let hasSafetySheet = Boolean(safetyHref);
-    let hasTechnicalSheet = Boolean(technicalHref);
-
-    if (hasSafetySheet && safetyHref) {
-      const safetyValid = await isValidPdfLink(page.finalUrl, safetyHref);
-      if (!safetyValid) {
-        hasSafetySheet = false;
-        extraComments.push('Fiche de données de sécurité invalide');
+    const hasTechnicalSheet = Boolean(technicalHref);
+    if (hasTechnicalSheet) {
+      if (technicalHref && validatePdfLinks) {
+        const technicalValid = await isValidPdfLink(page.finalUrl, technicalHref);
+        if (!technicalValid) {
+          extraComments.push('Lien vers la fiche technique invalide');
+        }
       }
+    } else {
+      extraComments.push('Fiche technique manquante');
     }
 
-    if (hasTechnicalSheet && technicalHref) {
-      const technicalValid = await isValidPdfLink(page.finalUrl, technicalHref);
-      if (!technicalValid) {
-        hasTechnicalSheet = false;
-        extraComments.push('Fiche technique invalide');
-      }
+    // Résultat final
+    if (extraComments.length > 0) {
+      return {
+        url,
+        result: 'KO',
+        comments: extraComments.join(' ; '),
+      };
+    } else {
+      return {
+        url,
+        result: 'OK',
+        comments: '',
+      };
     }
-
-    return buildOutcome(url, hasSafetySheet, hasTechnicalSheet, false, extraComments);
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'Erreur inconnue';
     return {
@@ -438,39 +477,6 @@ function resolveUrl(baseUrl: string, maybeRelative: string): string {
   } catch (error) {
     return maybeRelative;
   }
-}
-
-function buildOutcome(
-  url: string,
-  hasSafetySheet: boolean,
-  hasTechnicalSheet: boolean,
-  missingSection: boolean,
-  extraComments: string[],
-): ValidationOutcome {
-  const missing: string[] = [...extraComments];
-  if (missingSection) {
-    missing.push('Section product-documentation absente');
-  }
-  if (!hasSafetySheet) {
-    missing.push('Fiche de données de sécurité manquante');
-  }
-  if (!hasTechnicalSheet) {
-    missing.push('Fiche technique manquante');
-  }
-
-  if (missing.length === 0) {
-    return {
-      url,
-      result: 'OK',
-      comments: '',
-    };
-  }
-
-  return {
-    url,
-    result: 'KO',
-    comments: missing.join(' ; '),
-  };
 }
 
 async function writeResults(outputPath: string, outcomes: ValidationOutcome[]): Promise<void> {
