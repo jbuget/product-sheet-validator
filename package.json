@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "cheerio": "^1.1.2",
+    "commander": "^11.1.0",
     "undici": "^5.28.3"
   },
   "keywords": [

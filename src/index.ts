@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { promises as fs } from 'fs';
 import { dirname, resolve } from 'path';
-import { load, type CheerioAPI, type Cheerio } from 'cheerio';
+import { Command } from 'commander';
+import { fromURL, type CheerioAPI, type Cheerio } from 'cheerio';
 import type { Element } from 'domhandler';
 import { Agent, setGlobalDispatcher } from 'undici';
 
@@ -33,56 +34,40 @@ setGlobalDispatcher(new Agent({
 }));
 
 function parseCliArgs(argv: string[]): CliOptions {
-  const args = [...argv.slice(2)];
-  let inputPath = DEFAULT_INPUT;
-  let outputPath = DEFAULT_OUTPUT;
-  let validatePdfLinks = DEFAULT_VALIDATE_PDF_LINKS;
+  const program = new Command();
+  program
+    .name('product-sheet-validator')
+    .description('CLI pour valider la présence des fiches PDF sur les pages produits')
+    .option('-i, --input <path>', "Fichier CSV d'entrée", DEFAULT_INPUT)
+    .option('-o, --output <path>', 'Fichier CSV de sortie', DEFAULT_OUTPUT)
+    .option('--skip-pdf-validation', 'Désactive la vérification des liens PDF')
+    .option('--pdf-validation', 'Force la vérification des liens PDF (valeur par défaut)')
+    .helpOption('-h, --help', 'Affiche cette aide');
 
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (arg === '--input' || arg === '-i') {
-      const value = args[i + 1];
-      if (!value) {
-        throw new Error('Option --input requires a value');
-      }
-      inputPath = value;
-      i += 1;
-    } else if (arg === '--output' || arg === '-o') {
-      const value = args[i + 1];
-      if (!value) {
-        throw new Error('Option --output requires a value');
-      }
-      outputPath = value;
-      i += 1;
-    } else if (arg === '--skip-pdf-validation') {
-      validatePdfLinks = false;
-    } else if (arg === '--pdf-validation') {
-      validatePdfLinks = true;
-    } else if (arg === '--help' || arg === '-h') {
-      printUsage();
-      process.exit(0);
-    } else {
-      throw new Error(`Unknown option: ${arg}`);
-    }
+  program.parse(argv);
+  const opts = program.opts<{
+    input?: string;
+    output?: string;
+    skipPdfValidation?: boolean;
+    pdfValidation?: boolean;
+  }>();
+
+  let validatePdfLinks = DEFAULT_VALIDATE_PDF_LINKS;
+  if (opts.skipPdfValidation) {
+    validatePdfLinks = false;
   }
+  if (opts.pdfValidation) {
+    validatePdfLinks = true;
+  }
+
+  const inputPath = opts.input ?? DEFAULT_INPUT;
+  const outputPath = opts.output ?? DEFAULT_OUTPUT;
 
   return {
     inputPath: resolve(process.cwd(), inputPath),
     outputPath: resolve(process.cwd(), outputPath),
     validatePdfLinks,
   };
-}
-
-function printUsage(): void {
-  const scriptName = 'product-sheet-validator';
-  const message = `Usage: ${scriptName} [options]\n\n` +
-    'Options:\n' +
-    '  -i, --input <path>    Fichier CSV d\'entrée (défaut: input/products.csv)\n' +
-    '  -o, --output <path>   Fichier CSV de sortie (défaut: output/results.csv)\n' +
-    '  --skip-pdf-validation  Désactive la vérification des liens PDF\n' +
-    '  --pdf-validation       Force la vérification des liens PDF (valeur par défaut)\n' +
-    '  -h, --help            Affiche cette aide\n';
-  console.log(message);
 }
 
 async function run(): Promise<void> {
@@ -293,8 +278,16 @@ async function validateProductPage(url: string, validatePdfLinks: boolean): Prom
       };
     }
 
-    // Charger le code HTML
-    const $ = load(page.html);
+    // Charger le code HTML via cheerio.fromURL avec des en-têtes alignés
+    const $ = await fromURL(url, {
+      requestOptions: {
+        method: 'GET',
+        headers: {
+          Accept: 'text/html,application/xhtml+xml',
+          'User-Agent': 'product-sheet-validator/1.0',
+        },
+      },
+    });
 
     const extraComments: string[] = [];
 
@@ -315,7 +308,7 @@ async function validateProductPage(url: string, validatePdfLinks: boolean): Prom
     ]);
     const hasSafetySheet = Boolean(safetyHref);
     if (hasSafetySheet) {
-      if (safetyHref &&  validatePdfLinks) {
+      if (safetyHref && validatePdfLinks) {
         const safetyValid = await isValidPdfLink(page.finalUrl, safetyHref);
         if (!safetyValid) {
           extraComments.push('Lien vers la fiche de sécurité invalide');
