@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.DS_Store
+input/*.csv
+output/*.csv
+*.log
+*.tsbuildinfo
+.vscode/
+.env
