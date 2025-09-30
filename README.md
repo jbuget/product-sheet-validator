@@ -14,7 +14,7 @@ Ce petit outil en Node.js vérifie automatiquement que les pages produits dispos
 Si tu n'as pas encore les sources, clone simplement le dépôt :
 
 ```bash
-git clone https://github.com/ton-organisation/product-sheet-validator.git
+git clone https://github.com/jbuget/product-sheet-validator.git
 cd product-sheet-validator
 ```
 
