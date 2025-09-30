@@ -1,0 +1,29 @@
+{
+  "name": "product-sheet-validator",
+  "version": "1.0.0",
+  "description": "CLI pour valider la présence des fiches PDF sur les pages produits",
+  "main": "dist/index.js",
+  "bin": {
+    "product-sheet-validator": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "undici": "^5.28.3"
+  },
+  "keywords": [
+    "cli",
+    "product",
+    "validation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "typescript": "^5.4.5"
+  }
+}

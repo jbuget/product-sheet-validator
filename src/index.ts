@@ -1,0 +1,573 @@
+#!/usr/bin/env node
+import { promises as fs } from 'fs';
+import { dirname, resolve } from 'path';
+import { load, type CheerioAPI, type Cheerio } from 'cheerio';
+import type { Element } from 'domhandler';
+import { Agent, setGlobalDispatcher } from 'undici';
+
+interface CliOptions {
+  inputPath: string;
+  outputPath: string;
+}
+
+interface ValidationOutcome {
+  url: string;
+  result: 'OK' | 'KO';
+  comments: string;
+}
+
+const DEFAULT_INPUT = 'input/products.csv';
+const DEFAULT_OUTPUT = 'output/results.csv';
+const MAX_CONCURRENT_REQUESTS = 16;
+const ANSI_GREEN = '\x1b[32m';
+const ANSI_RED = '\x1b[31m';
+const ANSI_BLUE = '\x1b[34m';
+const ANSI_RESET = '\x1b[0m';
+
+setGlobalDispatcher(new Agent({
+  keepAliveTimeout: 10_000,
+  keepAliveMaxTimeout: 60_000,
+  pipelining: 1,
+}));
+
+function parseCliArgs(argv: string[]): CliOptions {
+  const args = [...argv.slice(2)];
+  let inputPath = DEFAULT_INPUT;
+  let outputPath = DEFAULT_OUTPUT;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--input' || arg === '-i') {
+      const value = args[i + 1];
+      if (!value) {
+        throw new Error('Option --input requires a value');
+      }
+      inputPath = value;
+      i += 1;
+    } else if (arg === '--output' || arg === '-o') {
+      const value = args[i + 1];
+      if (!value) {
+        throw new Error('Option --output requires a value');
+      }
+      outputPath = value;
+      i += 1;
+    } else if (arg === '--help' || arg === '-h') {
+      printUsage();
+      process.exit(0);
+    } else {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+  }
+
+  return {
+    inputPath: resolve(process.cwd(), inputPath),
+    outputPath: resolve(process.cwd(), outputPath),
+  };
+}
+
+function printUsage(): void {
+  const scriptName = 'product-sheet-validator';
+  const message = `Usage: ${scriptName} [options]\n\n` +
+    'Options:\n' +
+    '  -i, --input <path>    Fichier CSV d\'entrée (défaut: input/products.csv)\n' +
+    '  -o, --output <path>   Fichier CSV de sortie (défaut: output/results.csv)\n' +
+    '  -h, --help            Affiche cette aide\n';
+  console.log(message);
+}
+
+async function run(): Promise<void> {
+  try {
+    const options = parseCliArgs(process.argv);
+    const inputContent = await fs.readFile(options.inputPath, 'utf8');
+    const records = parseCsv(inputContent);
+    if (records.length === 0) {
+      throw new Error('Le fichier CSV ne contient aucune donnée');
+    }
+
+    const header = records[0];
+    const dataRows = records.slice(1);
+    const urlColumnIndex = findUrlColumnIndex(header);
+    if (urlColumnIndex === -1) {
+      throw new Error('Impossible de trouver une colonne "URL" dans le CSV');
+    }
+
+    const orderedUrls: string[] = [];
+    const seenUrls = new Set<string>();
+    const uniqueUrls: string[] = [];
+
+    for (const row of dataRows) {
+      const url = (row[urlColumnIndex] ?? '').trim();
+      if (!url) {
+        continue;
+      }
+      orderedUrls.push(url);
+      if (!seenUrls.has(url)) {
+        seenUrls.add(url);
+        uniqueUrls.push(url);
+      }
+    }
+
+    const outcomes: ValidationOutcome[] = [];
+
+    if (orderedUrls.length === 0) {
+      console.warn('Aucune URL valide trouvée dans le fichier d\'entrée.');
+    } else {
+      const totalUnique = uniqueUrls.length;
+      const progress = totalUnique > 0 ? createProgressReporter(totalUnique, 10_000) : null;
+      const loggedUniqueUrls = new Set<string>();
+      let uniqueOutcomes: Map<string, ValidationOutcome> = new Map();
+
+      try {
+        uniqueOutcomes = await validateUrls(uniqueUrls, (outcome) => {
+          progress?.onProcessed();
+          loggedUniqueUrls.add(outcome.url);
+          logOutcome(outcome);
+        });
+      } finally {
+        progress?.finish();
+      }
+
+      for (const url of orderedUrls) {
+        const outcome = uniqueOutcomes.get(url);
+        if (!outcome) {
+          const fallback: ValidationOutcome = {
+            url,
+            result: 'KO',
+            comments: 'Validation indisponible',
+          };
+          outcomes.push(fallback);
+          logOutcome(fallback);
+          continue;
+        }
+        outcomes.push(outcome);
+        if (!loggedUniqueUrls.has(url)) {
+          logOutcome(outcome);
+        }
+      }
+    }
+
+    await writeResults(options.outputPath, outcomes);
+    console.log(`\nRésultats enregistrés dans ${options.outputPath}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Erreur: ${message}`);
+    process.exitCode = 1;
+  }
+}
+
+function isHttpUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch (error) {
+    return false;
+  }
+}
+
+function detectDelimiter(firstLine: string): string {
+  const commaCount = (firstLine.match(/,/g) ?? []).length;
+  const semicolonCount = (firstLine.match(/;/g) ?? []).length;
+  if (semicolonCount > commaCount) {
+    return ';';
+  }
+  if (commaCount > 0) {
+    return ',';
+  }
+  return ';';
+}
+
+function parseCsv(content: string): string[][] {
+  const lines: string[][] = [];
+  const sanitized = content.replace(/\r\n/g, '\n');
+  const firstNonEmptyLine = sanitized.split('\n').find((line) => line.trim().length > 0) ?? '';
+  const delimiter = detectDelimiter(firstNonEmptyLine);
+
+  let currentValue = '';
+  let currentRow: string[] = [];
+  let insideQuotes = false;
+
+  for (let i = 0; i < sanitized.length; i += 1) {
+    const char = sanitized[i];
+
+    if (char === '"') {
+      if (insideQuotes && sanitized[i + 1] === '"') {
+        currentValue += '"';
+        i += 1;
+      } else {
+        insideQuotes = !insideQuotes;
+      }
+      continue;
+    }
+
+    if (!insideQuotes && char === delimiter) {
+      currentRow.push(currentValue);
+      currentValue = '';
+      continue;
+    }
+
+    if (!insideQuotes && char === '\n') {
+      currentRow.push(currentValue);
+      lines.push(currentRow);
+      currentRow = [];
+      currentValue = '';
+      continue;
+    }
+
+    currentValue += char;
+  }
+
+  if (insideQuotes) {
+    throw new Error('Le fichier CSV est mal formé: guillemets non fermés');
+  }
+
+  if (currentValue.length > 0 || currentRow.length > 0) {
+    currentRow.push(currentValue);
+    lines.push(currentRow);
+  }
+
+  return lines.filter((row) => row.some((value) => value.trim().length > 0));
+}
+
+function findUrlColumnIndex(header: string[]): number {
+  return header.findIndex((column) => column.trim().toLowerCase() === 'url');
+}
+
+async function validateUrls(
+  urls: string[],
+  onOutcome?: (outcome: ValidationOutcome) => void,
+): Promise<Map<string, ValidationOutcome>> {
+  const results = new Map<string, ValidationOutcome>();
+  if (urls.length === 0) {
+    return results;
+  }
+
+  let currentIndex = 0;
+  const workerCount = Math.min(MAX_CONCURRENT_REQUESTS, urls.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      if (currentIndex >= urls.length) {
+        break;
+      }
+      const index = currentIndex;
+      currentIndex += 1;
+      const url = urls[index];
+      const outcome = await validateProductPage(url);
+      results.set(url, outcome);
+      if (onOutcome) {
+        onOutcome(outcome);
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
+async function validateProductPage(url: string): Promise<ValidationOutcome> {
+  if (!isHttpUrl(url)) {
+    return {
+      url,
+      result: 'KO',
+      comments: 'URL invalide ou protocole non supporté',
+    };
+  }
+
+  try {
+    const page = await fetchPage(url);
+    if (!isSameProductUrl(url, page.finalUrl) || page.redirected) {
+      const target = page.finalUrl;
+      const comments = `Redirection vers ${target}`;
+      return buildOutcome(url, false, false, false, [comments]);
+    }
+
+    const $ = load(page.html);
+
+    const documentationSection = findDocumentationSection($);
+    if (!documentationSection) {
+      return buildOutcome(url, false, false, true, []);
+    }
+
+    const safetyHref = findDocumentationLink(documentationSection, [
+      'product-documentation__link',
+      'product-documentation__link--safety-data-sheet',
+    ]);
+    const technicalHref = findDocumentationLink(documentationSection, [
+      'product-documentation__link',
+      'product-documentation__link--technical-data-sheet',
+    ]);
+
+    const extraComments: string[] = [];
+    let hasSafetySheet = Boolean(safetyHref);
+    let hasTechnicalSheet = Boolean(technicalHref);
+
+    if (hasSafetySheet && safetyHref) {
+      const safetyValid = await isValidPdfLink(page.finalUrl, safetyHref);
+      if (!safetyValid) {
+        hasSafetySheet = false;
+        extraComments.push('Fiche de données de sécurité invalide');
+      }
+    }
+
+    if (hasTechnicalSheet && technicalHref) {
+      const technicalValid = await isValidPdfLink(page.finalUrl, technicalHref);
+      if (!technicalValid) {
+        hasTechnicalSheet = false;
+        extraComments.push('Fiche technique invalide');
+      }
+    }
+
+    return buildOutcome(url, hasSafetySheet, hasTechnicalSheet, false, extraComments);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'Erreur inconnue';
+    return {
+      url,
+      result: 'KO',
+      comments: `Échec du chargement de la page (${reason})`,
+    };
+  }
+}
+
+interface FetchedPage {
+  html: string;
+  finalUrl: string;
+  redirected: boolean;
+}
+
+async function fetchPage(url: string): Promise<FetchedPage> {
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'text/html,application/xhtml+xml',
+      'User-Agent': 'product-sheet-validator/1.0',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`statut HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  return {
+    html,
+    finalUrl: response.url ?? url,
+    redirected: response.redirected,
+  };
+}
+
+function isSameProductUrl(requestedUrl: string, finalUrl: string): boolean {
+  try {
+    const requested = new URL(requestedUrl);
+    const final = new URL(finalUrl);
+
+    if (requested.hostname !== final.hostname) {
+      return false;
+    }
+
+    return normalizePath(requested.pathname) === normalizePath(final.pathname);
+  } catch (error) {
+    return false;
+  }
+}
+
+function normalizePath(pathname: string): string {
+  if (pathname === '/') {
+    return pathname;
+  }
+  return pathname.replace(/\/+/g, '/').replace(/\/$/, '').toLowerCase();
+}
+
+function findDocumentationSection($: CheerioAPI): Cheerio<Element> | null {
+  const section = $('.page__content.rte.text-subtext.product-documentation').first();
+  return section.length > 0 ? (section as Cheerio<Element>) : null;
+}
+
+function findDocumentationLink(
+  section: Cheerio<Element>,
+  requiredClasses: string[],
+): string | null {
+  const link = section
+    .children('a')
+    .filter((_, element: Element) => {
+      if (element.type !== 'tag') {
+        return false;
+      }
+      const classAttr = element.attribs?.class;
+      if (!classAttr) {
+        return false;
+      }
+      const classNames = classAttr.split(/\s+/).filter(Boolean);
+      return requiredClasses.every((className) => classNames.includes(className));
+    })
+    .first() as Cheerio<Element>;
+
+  if (link.length === 0) {
+    return null;
+  }
+
+  const href = link.attr('href')?.trim();
+  return href && href.length > 0 ? href : null;
+}
+
+async function isValidPdfLink(baseUrl: string, href: string): Promise<boolean> {
+  try {
+    const absoluteUrl = resolveUrl(baseUrl, href);
+    const response = await fetch(absoluteUrl, {
+      method: 'HEAD',
+      headers: {
+        'User-Agent': 'product-sheet-validator/1.0',
+      },
+    });
+    if (!response.ok) {
+      return false;
+    }
+    const contentType = response.headers.get('content-type') ?? '';
+    const contentDisposition = response.headers.get('content-disposition') ?? '';
+    const finalUrl = response.url ?? absoluteUrl;
+    const isPdfHeader = contentType.toLowerCase().includes('application/pdf')
+      || contentDisposition.toLowerCase().includes('application/pdf')
+      || contentDisposition.toLowerCase().includes('.pdf');
+    const isPdfUrl = /\.pdf(?:[?#]|$)/i.test(finalUrl);
+    return isPdfHeader || isPdfUrl;
+  } catch (error) {
+    return false;
+  }
+}
+
+function resolveUrl(baseUrl: string, maybeRelative: string): string {
+  try {
+    return new URL(maybeRelative, baseUrl).toString();
+  } catch (error) {
+    return maybeRelative;
+  }
+}
+
+function buildOutcome(
+  url: string,
+  hasSafetySheet: boolean,
+  hasTechnicalSheet: boolean,
+  missingSection: boolean,
+  extraComments: string[],
+): ValidationOutcome {
+  const missing: string[] = [...extraComments];
+  if (missingSection) {
+    missing.push('Section product-documentation absente');
+  }
+  if (!hasSafetySheet) {
+    missing.push('Fiche de données de sécurité manquante');
+  }
+  if (!hasTechnicalSheet) {
+    missing.push('Fiche technique manquante');
+  }
+
+  if (missing.length === 0) {
+    return {
+      url,
+      result: 'OK',
+      comments: '',
+    };
+  }
+
+  return {
+    url,
+    result: 'KO',
+    comments: missing.join(' ; '),
+  };
+}
+
+async function writeResults(outputPath: string, outcomes: ValidationOutcome[]): Promise<void> {
+  const rows = [
+    ['URL', 'result', 'comments'],
+    ...outcomes.map((outcome) => [outcome.url, outcome.result, outcome.comments]),
+  ];
+  const csv = serializeCsv(rows, ';');
+
+  await fs.mkdir(dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, csv, 'utf8');
+}
+
+function serializeCsv(rows: string[][], delimiter: string): string {
+  return rows
+    .map((row) => row.map((value) => escapeCsvValue(value, delimiter)).join(delimiter))
+    .join('\n');
+}
+
+function escapeCsvValue(value: string, delimiter: string): string {
+  const needsQuoting = value.includes(delimiter) || value.includes('\n') || value.includes('"');
+  if (!needsQuoting) {
+    return value;
+  }
+  const escaped = value.replace(/"/g, '""');
+  return `"${escaped}"`;
+}
+
+interface ProgressReporter {
+  onProcessed: () => void;
+  finish: () => void;
+}
+
+function createProgressReporter(total: number, intervalMs = 10_000): ProgressReporter {
+  let processed = 0;
+  const startTime = Date.now();
+  let finished = false;
+
+  const logProgress = (isFinal: boolean): void => {
+    const tag = `${ANSI_BLUE}[progress]${ANSI_RESET}`;
+    const elapsedMs = Date.now() - startTime;
+    const percentage = total === 0 ? 100 : Math.min(100, (processed / total) * 100);
+    const elapsedStr = formatDuration(elapsedMs);
+    const remainingMs = processed === 0
+      ? null
+      : Math.max(0, Math.round((elapsedMs / processed) * (total - processed)));
+    const remainingStr = remainingMs === null ? 'indéterminé' : formatDuration(remainingMs);
+
+    if (isFinal) {
+      console.log(`\n${tag} ${processed}/${total} (${percentage.toFixed(1)}%) - temps total ${elapsedStr}\n`);
+    } else {
+      console.log(`\n${tag} ${processed}/${total} (${percentage.toFixed(1)}%) - temps écoulé ${elapsedStr} - temps restant estimé ${remainingStr}\n`);
+    }
+  };
+
+  const timer = setInterval(() => {
+    if (finished) {
+      return;
+    }
+    logProgress(false);
+  }, intervalMs);
+
+  return {
+    onProcessed: () => {
+      processed += 1;
+    },
+    finish: () => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      clearInterval(timer);
+      logProgress(true);
+    },
+  };
+}
+
+function formatDuration(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.round(milliseconds / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function logOutcome(outcome: ValidationOutcome): void {
+  const status = outcome.result === 'OK'
+    ? `${ANSI_GREEN}[OK]${ANSI_RESET}`
+    : `${ANSI_RED}[KO]${ANSI_RESET}`;
+  if (outcome.comments) {
+    console.log(`${status} ${outcome.url} - ${outcome.comments}`);
+  } else {
+    console.log(`${status} ${outcome.url}`);
+  }
+}
+
+void run();
