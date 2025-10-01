@@ -1,17 +1,10 @@
 #!/usr/bin/env node
 import { promises as fs } from 'fs';
-import { dirname, resolve } from 'path';
-import { Command, InvalidArgumentError } from 'commander';
+import { dirname } from 'path';
 import { fromURL, type CheerioAPI, type Cheerio } from 'cheerio';
 import type { Element } from 'domhandler';
 import { Agent, setGlobalDispatcher } from 'undici';
-
-interface CliOptions {
-  inputPath: string;
-  outputPath: string;
-  validatePdfLinks: boolean;
-  delayMs: number;
-}
+import { parseCliArgs } from './cli';
 
 interface ValidationOutcome {
   url: string;
@@ -19,10 +12,6 @@ interface ValidationOutcome {
   comments: string;
 }
 
-const DEFAULT_INPUT = 'input/products.csv';
-const DEFAULT_OUTPUT = 'output/results.csv';
-const DEFAULT_VALIDATE_PDF_LINKS = true;
-const DEFAULT_FETCH_DELAY_MS = 200;
 const MAX_CONCURRENT_REQUESTS = 16;
 const ANSI_GREEN = '\x1b[32m';
 const ANSI_RED = '\x1b[31m';
@@ -34,133 +23,6 @@ setGlobalDispatcher(new Agent({
   keepAliveMaxTimeout: 60_000,
   pipelining: 1,
 }));
-
-function parseCliArgs(argv: string[]): CliOptions {
-  const program = new Command();
-  program
-    .name('product-sheet-validator')
-    .description('CLI pour valider la présence des fiches PDF sur les pages produits')
-    .option('-i, --input <path>', "Fichier CSV d'entrée", DEFAULT_INPUT)
-    .option('-o, --output <path>', 'Fichier CSV de sortie', DEFAULT_OUTPUT)
-    .option('-d, --delay <ms>', "Délai entre les requêtes HTTP (ms)", DEFAULT_FETCH_DELAY_MS.toString())
-    .option('--skip-pdf-validation', 'Désactive la vérification des liens PDF')
-    .option('--pdf-validation', 'Force la vérification des liens PDF (valeur par défaut)')
-    .helpOption('-h, --help', 'Affiche cette aide');
-
-  program.parse(argv);
-  const opts = program.opts<{
-    input?: string;
-    output?: string;
-    skipPdfValidation?: boolean;
-    pdfValidation?: boolean;
-    delay?: string;
-  }>();
-
-  let validatePdfLinks = DEFAULT_VALIDATE_PDF_LINKS;
-  if (opts.skipPdfValidation) {
-    validatePdfLinks = false;
-  }
-  if (opts.pdfValidation) {
-    validatePdfLinks = true;
-  }
-
-  const inputPath = opts.input ?? DEFAULT_INPUT;
-  const outputPath = opts.output ?? DEFAULT_OUTPUT;
-  const delayMs = parseDelay(opts.delay);
-
-  return {
-    inputPath: resolve(process.cwd(), inputPath),
-    outputPath: resolve(process.cwd(), outputPath),
-    validatePdfLinks,
-    delayMs,
-  };
-}
-
-function parseDelay(value: string | undefined): number {
-  if (!value) {
-    return DEFAULT_FETCH_DELAY_MS;
-  }
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new InvalidArgumentError('La valeur du délai doit être un entier strictement positif.');
-  }
-  return parsed;
-}
-
-async function run(): Promise<void> {
-  try {
-    const options = parseCliArgs(process.argv);
-    const inputContent = await fs.readFile(options.inputPath, 'utf8');
-    const records = parseCsv(inputContent);
-    if (records.length === 0) {
-      throw new Error('Le fichier CSV ne contient aucune donnée');
-    }
-
-    const header = records[0];
-    const dataRows = records.slice(1);
-    const urlColumnIndex = findUrlColumnIndex(header);
-    if (urlColumnIndex === -1) {
-      throw new Error('Impossible de trouver une colonne "URL" dans le CSV');
-    }
-
-    const seenUrls = new Set<string>();
-    const uniqueUrls: string[] = [];
-
-    for (const row of dataRows) {
-      const url = (row[urlColumnIndex] ?? '').trim();
-      if (!url) {
-        continue;
-      }
-      if (!seenUrls.has(url)) {
-        seenUrls.add(url);
-        uniqueUrls.push(url);
-      }
-    }
-
-    if (uniqueUrls.length === 0) {
-      console.warn('Aucune URL valide trouvée dans le fichier d\'entrée.');
-    }
-
-    const outcomes: ValidationOutcome[] = [];
-
-    if (uniqueUrls.length > 0) {
-      const totalUnique = uniqueUrls.length;
-      const progress = createProgressReporter(totalUnique, 10_000);
-      let uniqueOutcomes: Map<string, ValidationOutcome> = new Map();
-
-      try {
-        uniqueOutcomes = await validateUrls(uniqueUrls, options.validatePdfLinks, options.delayMs, (outcome) => {
-          progress.onProcessed();
-          logOutcome(outcome);
-        });
-      } finally {
-        progress.finish();
-      }
-
-      for (const url of uniqueUrls) {
-        const outcome = uniqueOutcomes.get(url);
-        if (!outcome) {
-          const fallback: ValidationOutcome = {
-            url,
-            result: 'KO',
-            comments: 'Validation indisponible',
-          };
-          outcomes.push(fallback);
-          logOutcome(fallback);
-          continue;
-        }
-        outcomes.push(outcome);
-      }
-    }
-
-    await writeResults(options.outputPath, outcomes);
-    console.log(`\nRésultats enregistrés dans ${options.outputPath}`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`Erreur: ${message}`);
-    process.exitCode = 1;
-  }
-}
 
 function detectDelimiter(firstLine: string): string {
   const commaCount = (firstLine.match(/,/g) ?? []).length;
@@ -607,6 +469,81 @@ function logOutcome(outcome: ValidationOutcome): void {
     console.log(`${status} ${outcome.url} - ${outcome.comments}`);
   } else {
     console.log(`${status} ${outcome.url}`);
+  }
+}
+
+async function run(): Promise<void> {
+  try {
+    const options = parseCliArgs(process.argv);
+    const inputContent = await fs.readFile(options.inputPath, 'utf8');
+    const records = parseCsv(inputContent);
+    if (records.length === 0) {
+      throw new Error('Le fichier CSV ne contient aucune donnée');
+    }
+
+    const header = records[0];
+    const dataRows = records.slice(1);
+    const urlColumnIndex = findUrlColumnIndex(header);
+    if (urlColumnIndex === -1) {
+      throw new Error('Impossible de trouver une colonne "URL" dans le CSV');
+    }
+
+    const seenUrls = new Set<string>();
+    const uniqueUrls: string[] = [];
+
+    for (const row of dataRows) {
+      const url = (row[urlColumnIndex] ?? '').trim();
+      if (!url) {
+        continue;
+      }
+      if (!seenUrls.has(url)) {
+        seenUrls.add(url);
+        uniqueUrls.push(url);
+      }
+    }
+
+    if (uniqueUrls.length === 0) {
+      console.warn('Aucune URL valide trouvée dans le fichier d\'entrée.');
+    }
+
+    const outcomes: ValidationOutcome[] = [];
+
+    if (uniqueUrls.length > 0) {
+      const totalUnique = uniqueUrls.length;
+      const progress = createProgressReporter(totalUnique, 10_000);
+      let uniqueOutcomes: Map<string, ValidationOutcome> = new Map();
+
+      try {
+        uniqueOutcomes = await validateUrls(uniqueUrls, options.validatePdfLinks, options.delayMs, (outcome) => {
+          progress.onProcessed();
+          logOutcome(outcome);
+        });
+      } finally {
+        progress.finish();
+      }
+
+      for (const url of uniqueUrls) {
+        const outcome = uniqueOutcomes.get(url);
+        if (!outcome) {
+          const fallback: ValidationOutcome = {
+            url,
+            result: 'KO',
+            comments: 'Validation indisponible',
+          };
+          outcomes.push(fallback);
+          logOutcome(fallback);
+          continue;
+        }
+        outcomes.push(outcome);
+      }
+    }
+
+    await writeResults(options.outputPath, outcomes);
+    console.log(`\nRésultats enregistrés dans ${options.outputPath}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Erreur: ${message}`);
+    process.exitCode = 1;
   }
 }
 
