@@ -1,6 +1,6 @@
 import { promises as fs } from 'fs';
 
-export async function readUrlsfromCsvFile(filePath: string): Promise<string[]> {
+export async function fromCsvFile(filePath: string): Promise<string[]> {
   const content = await fs.readFile(filePath, 'utf8');
   const records = parseCsv(content);
 
