@@ -5,6 +5,7 @@ import { fromURL, type CheerioAPI, type Cheerio } from 'cheerio';
 import type { Element } from 'domhandler';
 import { Agent, setGlobalDispatcher } from 'undici';
 import { parseCliArgs } from './cli';
+import { fetchPage, fetchWithDelay } from './fetch';
 
 interface ValidationOutcome {
   url: string;
@@ -243,33 +244,6 @@ async function validateProductPage(
   }
 }
 
-interface FetchedPage {
-  html: string;
-  finalUrl: string;
-  redirected: boolean;
-}
-
-async function fetchPage(url: string, delayMs: number): Promise<FetchedPage> {
-  const response = await fetchWithDelay(url, {
-    method: 'GET',
-    headers: {
-      Accept: 'text/html,application/xhtml+xml',
-      'User-Agent': 'shopify-page-validator/1.0',
-    },
-  }, delayMs);
-
-  if (!response.ok) {
-    throw new Error(`statut HTTP ${response.status}`);
-  }
-
-  const html = await response.text();
-  return {
-    html,
-    finalUrl: response.url ?? url,
-    redirected: response.redirected,
-  };
-}
-
 function isSameProductUrl(requestedUrl: string, finalUrl: string): boolean {
   try {
     const requested = new URL(requestedUrl);
@@ -355,24 +329,6 @@ function resolveUrl(baseUrl: string, maybeRelative: string): string {
   } catch (error) {
     return maybeRelative;
   }
-}
-
-async function fetchWithDelay(
-  input: RequestInfo | URL,
-  init: RequestInit,
-  delayMs: number,
-): Promise<Response> {
-  if (delayMs > 0) {
-    await sleep(delayMs);
-  }
-
-  return fetch(input, init);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
 }
 
 async function writeResults(outputPath: string, outcomes: ValidationOutcome[]): Promise<void> {
