@@ -26,7 +26,7 @@ export async function fetchPage(url: string, delayMs: number): Promise<FetchedPa
         method: 'GET',
         headers: {
             Accept: 'text/html,application/xhtml+xml',
-            'User-Agent': 'shopify-page-validator/1.0',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:115.0) Gecko/20100101 Firefox/115.0',
         },
     }, delayMs);
 
@@ -41,4 +41,3 @@ export async function fetchPage(url: string, delayMs: number): Promise<FetchedPa
         redirected: response.redirected,
     };
 }
-
