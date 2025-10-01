@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-import { promises as fs } from 'fs';
-import { dirname } from 'path';
 import { Agent, setGlobalDispatcher } from 'undici';
 import { parseCliArgs } from './cli';
 import { fromCsvFile } from './urls';
+import { writeResultsToCsvFile } from './results';
 import { validateUrls, type ValidationOutcome } from './validator';
 
 const ANSI_GREEN = '\x1b[32m';
@@ -16,32 +15,6 @@ setGlobalDispatcher(new Agent({
   keepAliveMaxTimeout: 60_000,
   pipelining: 1,
 }));
-
-async function writeResults(outputPath: string, outcomes: ValidationOutcome[]): Promise<void> {
-  const rows = [
-    ['URL', 'result', 'comments'],
-    ...outcomes.map((outcome) => [outcome.url, outcome.result, outcome.comments]),
-  ];
-  const csv = serializeCsv(rows, ';');
-
-  await fs.mkdir(dirname(outputPath), { recursive: true });
-  await fs.writeFile(outputPath, csv, 'utf8');
-}
-
-function serializeCsv(rows: string[][], delimiter: string): string {
-  return rows
-    .map((row) => row.map((value) => escapeCsvValue(value, delimiter)).join(delimiter))
-    .join('\n');
-}
-
-function escapeCsvValue(value: string, delimiter: string): string {
-  const needsQuoting = value.includes(delimiter) || value.includes('\n') || value.includes('"');
-  if (!needsQuoting) {
-    return value;
-  }
-  const escaped = value.replace(/"/g, '""');
-  return `"${escaped}"`;
-}
 
 interface ProgressReporter {
   onProcessed: () => void;
@@ -154,7 +127,7 @@ async function run(): Promise<void> {
       outcomes.push(outcome);
     }
 
-    await writeResults(options.outputPath, outcomes);
+    await writeResultsToCsvFile(options.outputPath, outcomes);
     console.log(`\nRésultats enregistrés dans ${options.outputPath}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
