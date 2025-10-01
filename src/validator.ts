@@ -8,7 +8,7 @@ export interface ValidationOutcome {
     comments: string;
 }
 
-const MAX_CONCURRENT_REQUESTS = 4;
+const MAX_CONCURRENT_REQUESTS = 8;
 
 export async function validateUrls(
     urls: string[],
