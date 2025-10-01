@@ -9,11 +9,13 @@
   "scripts": {
     "build": "tsc",
     "start": "npm run build && node dist/index.js",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "postinstall": "playwright install"
   },
   "dependencies": {
     "cheerio": "^1.1.2",
     "commander": "^11.1.0",
+    "playwright": "^1.55.1",
     "undici": "^5.28.3"
   },
   "keywords": [

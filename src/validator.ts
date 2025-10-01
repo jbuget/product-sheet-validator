@@ -1,6 +1,6 @@
 import { load, type CheerioAPI, type Cheerio } from 'cheerio';
 import type { Element } from 'domhandler';
-import { fetchPage, fetchWithDelay } from './fetch';
+import { renderProductPage, fetchWithDelay } from './fetch';
 
 export interface ValidationOutcome {
     url: string;
@@ -59,7 +59,7 @@ async function validateProductPage(
     let page;
 
     try {
-        page = await fetchPage(url, delayMs);
+        page = await renderProductPage(url, delayMs);
     } catch (error) {
         const reason = error instanceof Error ? error.message : 'Erreur inconnue';
         return {

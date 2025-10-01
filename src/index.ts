@@ -5,6 +5,7 @@ import { fromCsvFile } from './urls';
 import { writeResultsToCsvFile } from './results';
 import { createProgressReporter } from './progress';
 import { logOutcome } from './logger';
+import { shutdownBrowser } from './fetch';
 import { validateUrls, type ValidationOutcome } from './validator';
 
 setGlobalDispatcher(new Agent({
@@ -59,6 +60,8 @@ async function run(): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`Erreur: ${message}`);
     process.exitCode = 1;
+  } finally {
+    await shutdownBrowser();
   }
 }
 

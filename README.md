@@ -7,7 +7,13 @@ Ce petit outil en Node.js vérifie automatiquement que les pages produits dispos
 1. **Git** (pour récupérer le projet).
 2. **Node.js** (version récente 18+ conseillée).
 3. **npm** (généralement fourni avec Node).
-4. Avoir un fichier CSV d’entrée contenant une colonne `URL`.
+4. **Playwright** doit disposer des navigateurs installés. Après `npm install`, exécute :
+
+   ```bash
+   npx playwright install
+   ```
+
+5. Avoir un fichier CSV d’entrée contenant une colonne `URL`.
 
 ## Récupérer le projet
 
@@ -62,5 +68,6 @@ Chaque URL est également loguée dans le terminal pendant l’exécution.
 - **npm introuvable** : installe Node.js via [nodejs.org](https://nodejs.org/).
 - **Problème d’accès réseau** : vérifie ta connexion internet et les éventuels blocages par un proxy ou un VPN.
 - **Aucune colonne `URL` détectée** : ouvre ton CSV et assure-toi que l’en-tête contient exactement `URL` (majuscules). Ajoute-la si nécessaire.
+- **Erreur Playwright / navigateur manquant** : relance `npx playwright install` pour installer les binaires.
 
 Bon contrôle !
