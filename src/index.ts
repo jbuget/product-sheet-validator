@@ -6,6 +6,7 @@ import type { Element } from 'domhandler';
 import { Agent, setGlobalDispatcher } from 'undici';
 import { parseCliArgs } from './cli';
 import { fetchPage, fetchWithDelay } from './fetch';
+import { readUrlsfromCsvFile } from './urls';
 
 interface ValidationOutcome {
   url: string;
@@ -24,74 +25,6 @@ setGlobalDispatcher(new Agent({
   keepAliveMaxTimeout: 60_000,
   pipelining: 1,
 }));
-
-function detectDelimiter(firstLine: string): string {
-  const commaCount = (firstLine.match(/,/g) ?? []).length;
-  const semicolonCount = (firstLine.match(/;/g) ?? []).length;
-  if (semicolonCount > commaCount) {
-    return ';';
-  }
-  if (commaCount > 0) {
-    return ',';
-  }
-  return ';';
-}
-
-function parseCsv(content: string): string[][] {
-  const lines: string[][] = [];
-  const sanitized = content.replace(/\r\n/g, '\n');
-  const firstNonEmptyLine = sanitized.split('\n').find((line) => line.trim().length > 0) ?? '';
-  const delimiter = detectDelimiter(firstNonEmptyLine);
-
-  let currentValue = '';
-  let currentRow: string[] = [];
-  let insideQuotes = false;
-
-  for (let i = 0; i < sanitized.length; i += 1) {
-    const char = sanitized[i];
-
-    if (char === '"') {
-      if (insideQuotes && sanitized[i + 1] === '"') {
-        currentValue += '"';
-        i += 1;
-      } else {
-        insideQuotes = !insideQuotes;
-      }
-      continue;
-    }
-
-    if (!insideQuotes && char === delimiter) {
-      currentRow.push(currentValue);
-      currentValue = '';
-      continue;
-    }
-
-    if (!insideQuotes && char === '\n') {
-      currentRow.push(currentValue);
-      lines.push(currentRow);
-      currentRow = [];
-      currentValue = '';
-      continue;
-    }
-
-    currentValue += char;
-  }
-
-  if (insideQuotes) {
-    throw new Error('Le fichier CSV est mal formé: guillemets non fermés');
-  }
-
-  if (currentValue.length > 0 || currentRow.length > 0) {
-    currentRow.push(currentValue);
-    lines.push(currentRow);
-  }
-
-  return lines.filter((row) => row.some((value) => value.trim().length > 0));
-}
-
-function findUrlColumnIndex(header: string[]): number {
-  return header.findIndex((column) => column.trim().toLowerCase() === 'url');
-}
 
 function isHttpUrl(url: string): boolean {
   try {
@@ -431,67 +364,41 @@ function logOutcome(outcome: ValidationOutcome): void {
 async function run(): Promise<void> {
   try {
     const options = parseCliArgs(process.argv);
-    const inputContent = await fs.readFile(options.inputPath, 'utf8');
-    const records = parseCsv(inputContent);
-    if (records.length === 0) {
-      throw new Error('Le fichier CSV ne contient aucune donnée');
-    }
-
-    const header = records[0];
-    const dataRows = records.slice(1);
-    const urlColumnIndex = findUrlColumnIndex(header);
-    if (urlColumnIndex === -1) {
-      throw new Error('Impossible de trouver une colonne "URL" dans le CSV');
-    }
-
-    const seenUrls = new Set<string>();
-    const uniqueUrls: string[] = [];
-
-    for (const row of dataRows) {
-      const url = (row[urlColumnIndex] ?? '').trim();
-      if (!url) {
-        continue;
-      }
-      if (!seenUrls.has(url)) {
-        seenUrls.add(url);
-        uniqueUrls.push(url);
-      }
-    }
+    const uniqueUrls = await readUrlsfromCsvFile(options.inputPath);
 
     if (uniqueUrls.length === 0) {
       console.warn('Aucune URL valide trouvée dans le fichier d\'entrée.');
+      process.exitCode = 1;
     }
 
     const outcomes: ValidationOutcome[] = [];
 
-    if (uniqueUrls.length > 0) {
-      const totalUnique = uniqueUrls.length;
-      const progress = createProgressReporter(totalUnique, 10_000);
-      let uniqueOutcomes: Map<string, ValidationOutcome> = new Map();
+    const totalUnique = uniqueUrls.length;
+    const progress = createProgressReporter(totalUnique, 10_000);
+    let uniqueOutcomes: Map<string, ValidationOutcome> = new Map();
 
-      try {
-        uniqueOutcomes = await validateUrls(uniqueUrls, options.validatePdfLinks, options.delayMs, (outcome) => {
-          progress.onProcessed();
-          logOutcome(outcome);
-        });
-      } finally {
-        progress.finish();
-      }
+    try {
+      uniqueOutcomes = await validateUrls(uniqueUrls, options.validatePdfLinks, options.delayMs, (outcome) => {
+        progress.onProcessed();
+        logOutcome(outcome);
+      });
+    } finally {
+      progress.finish();
+    }
 
-      for (const url of uniqueUrls) {
-        const outcome = uniqueOutcomes.get(url);
-        if (!outcome) {
-          const fallback: ValidationOutcome = {
-            url,
-            result: 'KO',
-            comments: 'Validation indisponible',
-          };
-          outcomes.push(fallback);
-          logOutcome(fallback);
-          continue;
-        }
-        outcomes.push(outcome);
+    for (const url of uniqueUrls) {
+      const outcome = uniqueOutcomes.get(url);
+      if (!outcome) {
+        const fallback: ValidationOutcome = {
+          url,
+          result: 'KO',
+          comments: 'Validation indisponible',
+        };
+        outcomes.push(fallback);
+        logOutcome(fallback);
+        continue;
       }
+      outcomes.push(outcome);
     }
 
     await writeResults(options.outputPath, outcomes);
