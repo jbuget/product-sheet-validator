@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { promises as fs } from 'fs';
 import { dirname, resolve } from 'path';
-import { Command } from 'commander';
+import { Command, InvalidArgumentError } from 'commander';
 import { fromURL, type CheerioAPI, type Cheerio } from 'cheerio';
 import type { Element } from 'domhandler';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -10,6 +10,7 @@ interface CliOptions {
   inputPath: string;
   outputPath: string;
   validatePdfLinks: boolean;
+  delayMs: number;
 }
 
 interface ValidationOutcome {
@@ -21,6 +22,7 @@ interface ValidationOutcome {
 const DEFAULT_INPUT = 'input/products.csv';
 const DEFAULT_OUTPUT = 'output/results.csv';
 const DEFAULT_VALIDATE_PDF_LINKS = true;
+const DEFAULT_FETCH_DELAY_MS = 200;
 const MAX_CONCURRENT_REQUESTS = 16;
 const ANSI_GREEN = '\x1b[32m';
 const ANSI_RED = '\x1b[31m';
@@ -40,6 +42,7 @@ function parseCliArgs(argv: string[]): CliOptions {
     .description('CLI pour valider la présence des fiches PDF sur les pages produits')
     .option('-i, --input <path>', "Fichier CSV d'entrée", DEFAULT_INPUT)
     .option('-o, --output <path>', 'Fichier CSV de sortie', DEFAULT_OUTPUT)
+    .option('-d, --delay <ms>', "Délai entre les requêtes HTTP (ms)", DEFAULT_FETCH_DELAY_MS.toString())
     .option('--skip-pdf-validation', 'Désactive la vérification des liens PDF')
     .option('--pdf-validation', 'Force la vérification des liens PDF (valeur par défaut)')
     .helpOption('-h, --help', 'Affiche cette aide');
@@ -50,6 +53,7 @@ function parseCliArgs(argv: string[]): CliOptions {
     output?: string;
     skipPdfValidation?: boolean;
     pdfValidation?: boolean;
+    delay?: string;
   }>();
 
   let validatePdfLinks = DEFAULT_VALIDATE_PDF_LINKS;
@@ -62,12 +66,25 @@ function parseCliArgs(argv: string[]): CliOptions {
 
   const inputPath = opts.input ?? DEFAULT_INPUT;
   const outputPath = opts.output ?? DEFAULT_OUTPUT;
+  const delayMs = parseDelay(opts.delay);
 
   return {
     inputPath: resolve(process.cwd(), inputPath),
     outputPath: resolve(process.cwd(), outputPath),
     validatePdfLinks,
+    delayMs,
   };
+}
+
+function parseDelay(value: string | undefined): number {
+  if (!value) {
+    return DEFAULT_FETCH_DELAY_MS;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new InvalidArgumentError('La valeur du délai doit être un entier strictement positif.');
+  }
+  return parsed;
 }
 
 async function run(): Promise<void> {
@@ -112,7 +129,7 @@ async function run(): Promise<void> {
       let uniqueOutcomes: Map<string, ValidationOutcome> = new Map();
 
       try {
-        uniqueOutcomes = await validateUrls(uniqueUrls, options.validatePdfLinks, (outcome) => {
+        uniqueOutcomes = await validateUrls(uniqueUrls, options.validatePdfLinks, options.delayMs, (outcome) => {
           progress.onProcessed();
           logOutcome(outcome);
         });
@@ -225,6 +242,7 @@ function isHttpUrl(url: string): boolean {
 async function validateUrls(
   urls: string[],
   validatePdfLinks: boolean,
+  delayMs: number,
   onOutcome?: (outcome: ValidationOutcome) => void,
 ): Promise<Map<string, ValidationOutcome>> {
   const results = new Map<string, ValidationOutcome>();
@@ -242,7 +260,7 @@ async function validateUrls(
       const index = currentIndex;
       currentIndex += 1;
       const url = urls[index];
-      const outcome = await validateProductPage(url, validatePdfLinks);
+      const outcome = await validateProductPage(url, validatePdfLinks, delayMs);
       results.set(url, outcome);
       if (onOutcome) {
         onOutcome(outcome);
@@ -254,7 +272,11 @@ async function validateUrls(
   return results;
 }
 
-async function validateProductPage(url: string, validatePdfLinks: boolean): Promise<ValidationOutcome> {
+async function validateProductPage(
+  url: string,
+  validatePdfLinks: boolean,
+  delayMs: number,
+): Promise<ValidationOutcome> {
   // Vérifier que l'URL est valide et utilise HTTP ou HTTPS
   if (!isHttpUrl(url)) {
     return {
@@ -266,7 +288,7 @@ async function validateProductPage(url: string, validatePdfLinks: boolean): Prom
 
   try {
     // Récupérer la page HTML
-    const page = await fetchPage(url);
+    const page = await fetchPage(url, delayMs);
 
     // Vérifier qu'il n'y a pas eu de redirection vers un autre produit ou la page d'accueil
     if (!isSameProductUrl(url, page.finalUrl) || page.redirected) {
@@ -284,7 +306,7 @@ async function validateProductPage(url: string, validatePdfLinks: boolean): Prom
         method: 'GET',
         headers: {
           Accept: 'text/html,application/xhtml+xml',
-          'User-Agent': 'product-sheet-validator/1.0',
+          'User-Agent': 'shopify-page-validator/1.0',
         },
       },
     });
@@ -309,7 +331,7 @@ async function validateProductPage(url: string, validatePdfLinks: boolean): Prom
     const hasSafetySheet = Boolean(safetyHref);
     if (hasSafetySheet) {
       if (safetyHref && validatePdfLinks) {
-        const safetyValid = await isValidPdfLink(page.finalUrl, safetyHref);
+        const safetyValid = await isValidPdfLink(page.finalUrl, safetyHref, delayMs);
         if (!safetyValid) {
           extraComments.push('Lien vers la fiche de sécurité invalide');
         }
@@ -326,7 +348,7 @@ async function validateProductPage(url: string, validatePdfLinks: boolean): Prom
     const hasTechnicalSheet = Boolean(technicalHref);
     if (hasTechnicalSheet) {
       if (technicalHref && validatePdfLinks) {
-        const technicalValid = await isValidPdfLink(page.finalUrl, technicalHref);
+        const technicalValid = await isValidPdfLink(page.finalUrl, technicalHref, delayMs);
         if (!technicalValid) {
           extraComments.push('Lien vers la fiche technique invalide');
         }
@@ -365,13 +387,14 @@ interface FetchedPage {
   redirected: boolean;
 }
 
-async function fetchPage(url: string): Promise<FetchedPage> {
-  const response = await fetch(url, {
+async function fetchPage(url: string, delayMs: number): Promise<FetchedPage> {
+  const response = await fetchWithDelay(url, {
+    method: 'GET',
     headers: {
       Accept: 'text/html,application/xhtml+xml',
-      'User-Agent': 'product-sheet-validator/1.0',
+      'User-Agent': 'shopify-page-validator/1.0',
     },
-  });
+  }, delayMs);
 
   if (!response.ok) {
     throw new Error(`statut HTTP ${response.status}`);
@@ -439,15 +462,15 @@ function findDocumentationLink(
   return href && href.length > 0 ? href : null;
 }
 
-async function isValidPdfLink(baseUrl: string, href: string): Promise<boolean> {
+async function isValidPdfLink(baseUrl: string, href: string, delayMs: number): Promise<boolean> {
   try {
     const absoluteUrl = resolveUrl(baseUrl, href);
-    const response = await fetch(absoluteUrl, {
+    const response = await fetchWithDelay(absoluteUrl, {
       method: 'HEAD',
       headers: {
-        'User-Agent': 'product-sheet-validator/1.0',
+        'User-Agent': 'shopify-page-validator/1.0',
       },
-    });
+    }, delayMs);
     if (!response.ok) {
       return false;
     }
@@ -470,6 +493,24 @@ function resolveUrl(baseUrl: string, maybeRelative: string): string {
   } catch (error) {
     return maybeRelative;
   }
+}
+
+async function fetchWithDelay(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  delayMs: number,
+): Promise<Response> {
+  if (delayMs > 0) {
+    await sleep(delayMs);
+  }
+
+  return fetch(input, init);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function writeResults(outputPath: string, outcomes: ValidationOutcome[]): Promise<void> {
