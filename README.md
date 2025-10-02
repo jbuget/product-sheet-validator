@@ -5,24 +5,25 @@ Ce petit outil en Node.js vérifie automatiquement que les pages produits dispos
 ## Pré-requis
 
 1. **Git** (pour récupérer le projet).
-2. **Node.js** (version récente 18+ conseillée).
+2. **Node.js** (version récente 22+ conseillée).
 3. **npm** (généralement fourni avec Node).
-4. **Playwright** doit disposer des navigateurs installés. Après `npm install`, exécute :
 
    ```bash
    npx playwright install
    ```
 
-5. Avoir un fichier CSV d’entrée contenant une colonne `URL`.
+4. Avoir un fichier CSV d’entrée contenant une colonne `URL`.
 
 ## Récupérer le projet
 
-Si tu n'as pas encore les sources, clone simplement le dépôt :
+Si Git est installé il suffit de clôner le dépôt :
 
 ```bash
-git clone https://github.com/jbuget/product-sheet-validator.git
-cd product-sheet-validator
+git clone https://github.com/jbuget/shopify-product-page-validator.git
+cd shopify-product-page-validator
 ```
+
+Sinon, il est possible de récupérer [l'archive des sources de la branche main](https://github.com/jbuget/shopify-product-page-validator/archive/refs/heads/main.zip) (fichier `.zip`).
 
 ## Installation
 
@@ -30,6 +31,7 @@ Dans le dossier du projet :
 
 ```bash
 npm install
+npm run build
 ```
 
 ## Préparer les fichiers
@@ -42,16 +44,14 @@ npm install
 Commande standard (lit `input/products.csv`, écrit `output/results.csv`) :
 
 ```bash
-npm start
+npx shopify-product-page-validator
 ```
 
 Pour utiliser un autre fichier :
 
 ```bash
-npm start -- --input chemin/vers/mon-fichier.csv --output chemin/vers/mes-resultats.csv
+npx shopify-product-page-validator --input chemin/vers/mon-fichier.csv --output chemin/vers/mes-resultats.csv
 ```
-
-> Astuce : le `--` avant `--input` est obligatoire pour transmettre les options au script TypeScript.
 
 ## Résultat
 

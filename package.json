@@ -1,10 +1,10 @@
 {
-  "name": "product-sheet-validator",
+  "name": "shopify-product-page-validator",
   "version": "1.0.0",
   "description": "CLI pour valider la présence des fiches PDF sur les pages produits",
   "main": "dist/index.js",
   "bin": {
-    "product-sheet-validator": "dist/index.js"
+    "shopify-product-page-validator": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",

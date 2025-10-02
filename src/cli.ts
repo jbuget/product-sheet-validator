@@ -16,7 +16,7 @@ export interface CliOptions {
 export function parseCliArgs(argv: string[]): CliOptions {
   const program = new Command();
   program
-    .name('product-sheet-validator')
+    .name('shopify-product-page-validator')
     .description('CLI pour valider la présence des fiches PDF sur les pages produits')
     .option('-i, --input <path>', "Fichier CSV d'entrée", DEFAULT_INPUT)
     .option('-o, --output <path>', 'Fichier CSV de sortie', DEFAULT_OUTPUT)
@@ -64,4 +64,3 @@ export function parseDelay(value: string | undefined): number {
   }
   return parsed;
 }
-
